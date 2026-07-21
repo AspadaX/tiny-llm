@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use candle_core::{Shape, Tensor, shape::Dim};
+use gemm::gemm;
 use half::{bf16, f16};
 use safetensors::{Dtype, SafeTensors};
 

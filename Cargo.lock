@@ -2189,6 +2189,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "crossterm",
+ "gemm",
  "half",
  "ratatui",
  "safetensors",
