@@ -1,8 +1,11 @@
-use std::sync::Arc;
+use std::{
+    cmp::max,
+    sync::{Arc, RwLock},
+};
 
 use anyhow::{Result, anyhow};
 use candle_core::{Shape, Tensor, shape::Dim};
-use gemm::gemm;
+use gemm::{Parallelism, gemm};
 use half::{bf16, f16};
 use safetensors::{Dtype, SafeTensors};
 
@@ -12,7 +15,7 @@ use safetensors::{Dtype, SafeTensors};
 pub struct TinyTensor {
     strides: Vec<usize>,
     shape: Vec<usize>,
-    data: Arc<Vec<f32>>,
+    data: Arc<RwLock<Vec<f32>>>,
 }
 
 impl TinyTensor {
@@ -20,7 +23,7 @@ impl TinyTensor {
         Self {
             strides: Self::compute_strides(shape),
             shape: shape.to_vec(),
-            data: Arc::new(data.to_vec()),
+            data: Arc::new(RwLock::new(data.to_vec())),
         }
     }
 
@@ -35,7 +38,7 @@ impl TinyTensor {
         strides
     }
 
-    pub fn new_without_reallocate(data: Arc<Vec<f32>>, shape: Vec<usize>) -> Self {
+    pub fn new_without_reallocate(data: Arc<RwLock<Vec<f32>>>, shape: Vec<usize>) -> Self {
         Self {
             strides: Self::compute_strides(&shape),
             shape: shape,
@@ -68,6 +71,8 @@ impl TinyTensor {
         Ok(Self::new(&data, shape))
     }
 
+    /// `count_from_end` will be ignored for 0 dim index.
+    /// empty `dim_indexes` will return the whole shape.
     pub fn get_shape(&self) -> &[usize] {
         &self.shape
     }
@@ -86,12 +91,12 @@ impl TinyTensor {
             ));
         }
 
-        Ok(self.data[0])
+        Ok(self.data.read().unwrap()[0])
     }
 }
 
 pub fn reshape(a: TinyTensor, shape: &[usize]) -> Result<TinyTensor> {
-    if shape.iter().product::<usize>() != a.data.len() {
+    if shape.iter().product::<usize>() != a.data.read().unwrap().len() {
         return Err(anyhow!("Shape mismatches the data"));
     }
 
@@ -121,8 +126,10 @@ pub fn select_index(a: &TinyTensor, indexes: &TinyTensor, dim: usize) -> Result<
         ));
     }
 
-    if indexes
-        .data
+    let indexes_data = indexes.data.read().unwrap();
+    let a_data = a.data.read().unwrap();
+
+    if indexes_data
         .iter()
         .any(|item| (*item as usize) >= a.shape[dim])
     {
@@ -132,21 +139,21 @@ pub fn select_index(a: &TinyTensor, indexes: &TinyTensor, dim: usize) -> Result<
     }
 
     let mut new_shape = a.shape.to_owned();
-    new_shape[dim] = indexes.data.len();
+    new_shape[dim] = indexes_data.len();
 
     let outer_group_count: usize = a.shape[..dim].iter().product();
     let stride = a.strides[dim];
 
-    let mut new_data = Vec::with_capacity(outer_group_count * indexes.data.len() * stride);
+    let mut new_data = Vec::with_capacity(outer_group_count * indexes_data.len() * stride);
 
     for outer_index in 0..outer_group_count {
         let outer_base = outer_index * a.shape[dim] * stride;
 
-        for index_position in 0..indexes.data.len() {
-            let start = outer_base + (stride * indexes.data[index_position] as usize);
+        for index_position in 0..indexes_data.len() {
+            let start = outer_base + (stride * indexes_data[index_position] as usize);
             let end = start + stride;
 
-            new_data.extend_from_slice(&a.data[start..end]);
+            new_data.extend_from_slice(&a_data[start..end]);
         }
     }
 
@@ -314,155 +321,330 @@ pub fn matrix_multiply(a: &TinyTensor, b: &TinyTensor) -> Result<TinyTensor> {
     Ok(TinyTensor::new(&destination, &destination_shape))
 }
 
-pub fn matrix_add(a: &TinyTensor, b: &TinyTensor) -> Result<TinyTensor> {
-    let new = a.inner.broadcast_add(&b.inner)?;
+/// Compute the new tensor's shape after a broadcasting computation.
+fn broadcast_shape(a: &TinyTensor, b: &TinyTensor) -> Result<Vec<usize>> {
+    let new_dim_length = max(a.shape.len(), b.shape.len());
+    let mut new_shape: Vec<usize> = vec![0; new_dim_length];
 
-    Ok(TinyTensor { inner: new })
+    for (index, dimension) in new_shape.iter_mut().enumerate() {
+        let reversed_index = new_dim_length - index;
+        let mut a_dimension = 1;
+        let mut b_dimension = 1;
+
+        // Align shapes from the trailing dimensions.
+        // Missing leading dimensions are treated as 1 for broadcasting.
+        if reversed_index <= a.rank() {
+            // Compute the index offset from right
+            a_dimension = a.shape[a.rank() - reversed_index];
+        }
+
+        if reversed_index <= b.rank() {
+            b_dimension = b.shape[b.rank() - reversed_index];
+        }
+
+        // Dimensions are compatible if they are equal, or if either one is 1.
+        if a_dimension != b_dimension && a_dimension != 1 && b_dimension != 1 {
+            return Err(anyhow!("Dimensions mismatch"));
+        }
+
+        *dimension = max(a_dimension, b_dimension);
+    }
+
+    Ok(new_shape)
 }
 
-pub fn transpose(tensor: &TinyTensor) -> Result<TinyTensor> {
+/// Compute the broadcasted shape's strides
+fn broadcast_as(
+    original_shape: &[usize],
+    original_stride: &[usize],
+    new_shape: &[usize],
+) -> Result<Vec<usize>> {
+    // original shape | original strides | target shape | expected strides
+    // [3]            | [1]              | [2, 3]       | [0, 1]
+    // [2, 1]         | [1, 1]           | [2, 4]       | [1, 0]
+    // [2, 3]         | [3, 1]           | [2, 4]       | error
+
+    if original_shape.len() != original_stride.len() {
+        return Err(anyhow!(
+            "Original tensor shapes and strides length mismatched"
+        ));
+    }
+
+    if new_shape.len() < original_shape.len() {
+        return Err(anyhow!("New shape should not be smaller than the old one"));
+    }
+
+    let added_shape = new_shape.len() - original_shape.len();
+    let mut new_strides = vec![0; added_shape];
+
+    for dimension in 0..original_shape.len() {
+        let original_shape_dimension = original_shape[dimension];
+        let new_shape_dimension = new_shape[added_shape + dimension];
+        let original_stride_dimension = original_stride[dimension];
+
+        let stride = if original_shape_dimension == new_shape_dimension {
+            original_stride_dimension
+        } else if original_shape_dimension != 1 {
+            return Err(anyhow!("Incompatible broadcast shape"));
+        } else {
+            0
+        };
+
+        new_strides.push(stride);
+    }
+
+    Ok(new_strides)
+}
+
+/// Create a broadcasted view of the tensor without copying its data.
+///
+/// Broadcasting is represented by changing shape/strides only.
+/// A stride of `0` means that dimension reuses the same underlying value.
+fn broadcast_view(a: &TinyTensor, shape: &[usize]) -> Result<TinyTensor> {
     Ok(TinyTensor {
-        inner: tensor.inner.t()?,
+        strides: broadcast_as(&a.shape, &a.strides, shape)?,
+        shape: shape.to_vec(),
+        data: a.data.clone(),
     })
 }
 
-pub fn transpose_with_dim(a: &TinyTensor, dim1: usize, dim2: usize) -> Result<TinyTensor> {
-    Ok(TinyTensor {
-        inner: a.inner.transpose(dim1, dim2)?,
-    })
+fn get_offset_from_linear_index(mut index: usize, shape: &[usize], strides: &[usize]) -> usize {
+    let mut offset = 0;
+
+    // For shape [2, 3, 4], the rightmost dimension changes fastest:
+    //
+    // linear index:  0  1  2  3  4  5 ...
+    // coordinates:  [0,0,0], [0,0,1], [0,0,2], [0,0,3], [0,1,0], [0,1,1] ...
+    //
+    // We loop over dimension indexes in reverse order: 2, 1, 0.
+    // That means we process dimension sizes 4, then 3, then 2.
+    for dim in (0..shape.len()).rev() {
+        // Size of the current dimension.
+        //
+        // Example:
+        // shape = [2, 3, 4]
+        //
+        // dim = 2 -> dimension = 4
+        // dim = 1 -> dimension = 3
+        // dim = 0 -> dimension = 2
+        let dimension = shape[dim];
+
+        // Find the coordinate for this dimension.
+        //
+        // `% dimension` gives "where we are" inside the current dimension.
+        //
+        // Example:
+        // shape = [2, 3, 4]
+        // index = 17
+        //
+        // For dim 2:
+        // coordinate = 17 % 4 = 1
+        //
+        // So in the last dimension, we are at position 1.
+        let coordinate = index % dimension;
+
+        // Remove the coordinate we just extracted.
+        //
+        // After this division, the next loop iteration can extract the coordinate
+        // for the dimension to the left.
+        //
+        // Example:
+        // index = 17
+        //
+        // After dim 2:
+        // index = 17 / 4 = 4
+        //
+        // Then dim 1 can use this reduced index to extract the coordinate
+        // for the next higher dimension.
+        index /= dimension;
+
+        // Convert this dimension's coordinate into movement inside the flat data buffer.
+        //
+        // `strides[dim]` tells us how far we move in memory when this coordinate
+        // increases by 1.
+        //
+        // Example with broadcasting:
+        // shape   = [2, 3]
+        // strides = [0, 1]
+        // coords  = [1, 1]
+        //
+        // offset contribution:
+        // dim 0 -> 1 * 0 = 0
+        // dim 1 -> 1 * 1 = 1
+        //
+        // total offset = 1
+        //
+        // The `0` stride is what makes broadcasting reuse the same row.
+        offset += coordinate * strides[dim];
+    }
+
+    offset
 }
 
-pub fn flatten(a: &TinyTensor, start_dim: usize, end_dim: usize) -> Result<TinyTensor> {
-    Ok(TinyTensor {
-        inner: a.inner.flatten(start_dim, end_dim)?,
-    })
-}
+fn perform_broadcast_binary_operation<F>(
+    a: &TinyTensor,
+    b: &TinyTensor,
+    operation: F,
+) -> Result<TinyTensor>
+where
+    F: Fn(f32, f32) -> f32,
+{
+    let broadcasted_shape = broadcast_shape(a, b)?;
 
-pub fn narrow<D: Dim>(
-    tensor: &TinyTensor,
-    dim: D,
-    start: usize,
-    length: usize,
-) -> Result<TinyTensor> {
-    Ok(TinyTensor {
-        inner: tensor.inner.narrow(dim, start, length)?,
-    })
-}
+    let a_view = broadcast_view(a, &broadcasted_shape)?;
+    let b_view = broadcast_view(b, &broadcasted_shape)?;
 
-pub fn broadcast_multiply(a: &TinyTensor, b: &TinyTensor) -> Result<TinyTensor> {
-    Ok(TinyTensor {
-        inner: a.inner.broadcast_mul(&b.inner)?,
-    })
-}
+    let a_data = a.data.read().unwrap();
+    let b_data = b.data.read().unwrap();
 
-pub fn broadcast_divide(a: &TinyTensor, b: &TinyTensor) -> Result<TinyTensor> {
-    Ok(TinyTensor {
-        inner: a.inner.broadcast_div(&b.inner)?,
-    })
-}
+    let output_data_length: usize = broadcasted_shape.iter().product();
+    let mut output_data = Vec::with_capacity(output_data_length);
 
-pub fn broadcast_substract(a: &TinyTensor, b: &TinyTensor) -> Result<TinyTensor> {
-    Ok(TinyTensor {
-        inner: a.inner.broadcast_sub(&b.inner)?,
-    })
+    for index in 0..output_data_length {
+        let offset_a = get_offset_from_linear_index(index, &broadcasted_shape, &a_view.strides);
+        let offset_b = get_offset_from_linear_index(index, &broadcasted_shape, &b_view.strides);
+
+        output_data.push(operation(a_data[offset_a], b_data[offset_b]));
+    }
+
+    Ok(TinyTensor::new(&output_data, &broadcasted_shape))
 }
 
 pub fn broadcast_add(a: &TinyTensor, b: &TinyTensor) -> Result<TinyTensor> {
-    Ok(TinyTensor {
-        inner: a.inner.broadcast_add(&b.inner)?,
-    })
+    perform_broadcast_binary_operation(a, b, |a, b| a + b)
 }
 
-pub fn concatenate(a: &TinyTensor, b: &TinyTensor, dim: usize) -> Result<TinyTensor> {
-    Ok(TinyTensor {
-        inner: Tensor::cat(&[&a.inner, &b.inner], dim)?,
-    })
+pub fn broadcast_multiply(a: &TinyTensor, b: &TinyTensor) -> Result<TinyTensor> {
+    perform_broadcast_binary_operation(a, b, |a, b| a * b)
 }
 
-pub fn concatenate_all(tensors: &[TinyTensor], dim: usize) -> Result<TinyTensor> {
-    Ok(TinyTensor {
-        inner: Tensor::cat(
-            &tensors
-                .iter()
-                .map(|item| &item.inner)
-                .collect::<Vec<&Tensor>>(),
-            dim,
-        )?,
-    })
+pub fn broadcast_divide(a: &TinyTensor, b: &TinyTensor) -> Result<TinyTensor> {
+    perform_broadcast_binary_operation(a, b, |a, b| a / b)
 }
 
-pub fn softmax(a: &TinyTensor) -> Result<TinyTensor> {
-    Ok(TinyTensor {
-        inner: candle_nn::ops::softmax_last_dim(&a.inner)?,
-    })
+pub fn broadcast_subtract(a: &TinyTensor, b: &TinyTensor) -> Result<TinyTensor> {
+    perform_broadcast_binary_operation(a, b, |a, b| a - b)
 }
 
-pub fn square(a: &TinyTensor) -> Result<TinyTensor> {
-    Ok(TinyTensor {
-        inner: a.inner.sqr()?,
-    })
-}
+// pub fn transpose(tensor: &TinyTensor) -> Result<TinyTensor> {
+//     Ok(TinyTensor {
+//         inner: tensor.inner.t()?,
+//     })
+// }
 
-pub fn mean<D>(a: &TinyTensor, dim: D) -> Result<TinyTensor>
-where
-    D: Dim,
-{
-    Ok(TinyTensor {
-        inner: a.inner.mean_keepdim(dim)?,
-    })
-}
+// pub fn transpose_with_dim(a: &TinyTensor, dim1: usize, dim2: usize) -> Result<TinyTensor> {
+//     Ok(TinyTensor {
+//         inner: a.inner.transpose(dim1, dim2)?,
+//     })
+// }
 
-pub fn square_root(a: &TinyTensor) -> Result<TinyTensor> {
-    Ok(TinyTensor {
-        inner: a.inner.sqrt()?,
-    })
-}
+// pub fn flatten(a: &TinyTensor, start_dim: usize, end_dim: usize) -> Result<TinyTensor> {
+//     Ok(TinyTensor {
+//         inner: a.inner.flatten(start_dim, end_dim)?,
+//     })
+// }
 
-pub fn silu(a: &TinyTensor) -> Result<TinyTensor> {
-    Ok(TinyTensor {
-        inner: a.inner.silu()?,
-    })
-}
+// pub fn narrow<D: Dim>(
+//     tensor: &TinyTensor,
+//     dim: D,
+//     start: usize,
+//     length: usize,
+// ) -> Result<TinyTensor> {
+//     Ok(TinyTensor {
+//         inner: tensor.inner.narrow(dim, start, length)?,
+//     })
+// }
 
-pub fn argmax(a: &TinyTensor, dim: usize) -> Result<TinyTensor> {
-    Ok(TinyTensor {
-        inner: a.inner.argmax(dim)?,
-    })
-}
+// pub fn concatenate(a: &TinyTensor, b: &TinyTensor, dim: usize) -> Result<TinyTensor> {
+//     Ok(TinyTensor {
+//         inner: Tensor::cat(&[&a.inner, &b.inner], dim)?,
+//     })
+// }
 
-pub fn repeat(a: &TinyTensor, shape: impl Into<Shape>) -> Result<TinyTensor> {
-    Ok(TinyTensor {
-        inner: a.inner.repeat(shape)?,
-    })
-}
+// pub fn concatenate_all(tensors: &[TinyTensor], dim: usize) -> Result<TinyTensor> {
+//     Ok(TinyTensor {
+//         inner: Tensor::cat(
+//             &tensors
+//                 .iter()
+//                 .map(|item| &item.inner)
+//                 .collect::<Vec<&Tensor>>(),
+//             dim,
+//         )?,
+//     })
+// }
 
-pub fn repeat_kv(a: &TinyTensor, n_repetition: usize) -> Result<TinyTensor> {
-    if a.get_shape().dims().len() != 4 {
-        return Err(anyhow!("Input tensor for kv repetition must be rank 4"));
-    }
+// pub fn softmax(a: &TinyTensor) -> Result<TinyTensor> {
+//     Ok(TinyTensor {
+//         inner: candle_nn::ops::softmax_last_dim(&a.inner)?,
+//     })
+// }
 
-    let shape = a.get_shape();
-    let (batch_size, num_kv_heads, sequence_length, head_dim) =
-        (shape.dim(0)?, shape.dim(1)?, shape.dim(2)?, shape.dim(3)?);
+// pub fn square(a: &TinyTensor) -> Result<TinyTensor> {
+//     Ok(TinyTensor {
+//         inner: a.inner.sqr()?,
+//     })
+// }
 
-    // Add a new dim after dim 0, 1 for storing repetition number
-    let new_a = unsqueeze(a, 2)?;
+// pub fn mean<D>(a: &TinyTensor, dim: D) -> Result<TinyTensor>
+// where
+//     D: Dim,
+// {
+//     Ok(TinyTensor {
+//         inner: a.inner.mean_keepdim(dim)?,
+//     })
+// }
 
-    let repeated = repeat(&new_a, (1, 1, n_repetition, 1, 1))?;
+// pub fn square_root(a: &TinyTensor) -> Result<TinyTensor> {
+//     Ok(TinyTensor {
+//         inner: a.inner.sqrt()?,
+//     })
+// }
 
-    Ok(reshape(
-        &repeated,
-        (
-            batch_size,
-            n_repetition * num_kv_heads,
-            sequence_length,
-            head_dim,
-        ),
-    )?)
-}
+// pub fn silu(a: &TinyTensor) -> Result<TinyTensor> {
+//     Ok(TinyTensor {
+//         inner: a.inner.silu()?,
+//     })
+// }
 
-pub fn broadcast_matrix_multiply(a: &TinyTensor, b: &TinyTensor) -> Result<TinyTensor> {
-    Ok(TinyTensor {
-        inner: a.inner.broadcast_matmul(&b.inner)?,
-    })
-}
+// pub fn argmax(a: &TinyTensor, dim: usize) -> Result<TinyTensor> {
+//     Ok(TinyTensor {
+//         inner: a.inner.argmax(dim)?,
+//     })
+// }
+
+// pub fn repeat(a: &TinyTensor, shape: impl Into<Shape>) -> Result<TinyTensor> {
+//     Ok(TinyTensor {
+//         inner: a.inner.repeat(shape)?,
+//     })
+// }
+
+// pub fn repeat_kv(a: &TinyTensor, n_repetition: usize) -> Result<TinyTensor> {
+//     if a.get_shape().dims().len() != 4 {
+//         return Err(anyhow!("Input tensor for kv repetition must be rank 4"));
+//     }
+
+//     let shape = a.get_shape();
+//     let (batch_size, num_kv_heads, sequence_length, head_dim) =
+//         (shape.dim(0)?, shape.dim(1)?, shape.dim(2)?, shape.dim(3)?);
+
+//     // Add a new dim after dim 0, 1 for storing repetition number
+//     let new_a = unsqueeze(a, 2)?;
+
+//     let repeated = repeat(&new_a, (1, 1, n_repetition, 1, 1))?;
+
+//     Ok(reshape(
+//         &repeated,
+//         (
+//             batch_size,
+//             n_repetition * num_kv_heads,
+//             sequence_length,
+//             head_dim,
+//         ),
+//     )?)
+// }
+
+// pub fn broadcast_matrix_multiply(a: &TinyTensor, b: &TinyTensor) -> Result<TinyTensor> {
+//     Ok(TinyTensor {
+//         inner: a.inner.broadcast_matmul(&b.inner)?,
+//     })
+// }
