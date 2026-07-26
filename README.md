@@ -1,6 +1,6 @@
-# tiny-llama
+# tiny-llm
 
-A minimal LLaMA-style inference engine for [MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B), built purely in Rust.
+A minimal LLM inference engine for [MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B), built purely in Rust.
 
 <p align="center">
   <img src="./demo.gif" width="540">
