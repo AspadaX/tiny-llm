@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./assets/20260728-160304.png" width="540">
+</p>
+
 # tiny-llm
 
 A minimal LLM inference engine for [MiniCPM5-1B](https://huggingface.co/openbmb/MiniCPM5-1B), built purely in Rust.
