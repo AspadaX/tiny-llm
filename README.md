@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/20260728-160304.png" width="540">
+  <img src="./assets/20260728-160304.png" width="1080">
 </p>
 
 # tiny-llm
