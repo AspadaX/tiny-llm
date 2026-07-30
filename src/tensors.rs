@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
-use candle_core::{Shape, Tensor, shape::Dim};
+
 use gemm::{Parallelism, gemm};
 use half::{bf16, f16};
 use safetensors::{Dtype, SafeTensors};
@@ -756,25 +756,22 @@ pub fn narrow(tensor: TinyTensor, dim: usize, start: usize, length: usize) -> Re
 }
 
 fn concatenate_contiguous(tensors: &[TinyTensor], dim: usize) -> Result<TinyTensor> {
-    if tensors.is_empty() {
-        return Err(anyhow!("No tensors to concatenate with"));
-    }
-
-    if tensors.len() == 1 {
-        return Ok(tensors[0].clone());
-    }
-
     let new_shape = compute_new_shape_for_concatenation(tensors, dim);
     let new_stride = TinyTensor::compute_strides(&new_shape);
-    let mut new_data = Vec::with_capacity(new_shape.iter().product());
+    let mut new_data = Vec::with_capacity(new_shape.iter().product::<usize>());
+
+    let contiguous_data = tensors
+        .iter()
+        .map(|tensor| make_contiguous_data(tensor.clone()))
+        .collect::<Result<Vec<_>>>()?;
 
     // In Rust, a product on an empty array will end up with 1
     let inner: usize = new_shape[dim + 1..].iter().product();
     let outer: usize = new_shape[..dim].iter().product();
 
     for outer_index in 0..outer {
-        for tensor in tensors.iter() {
-            // How long the window moves across the flat data array
+        for (tensor, tensor_data) in tensors.iter().zip(contiguous_data.iter()) {
+            // How many contiguous elements this window copies from the flat data array
             let block_length = inner * tensor.shape[dim];
 
             // Visualize the moving window on each tensor's flat data array:
@@ -829,15 +826,73 @@ fn concatenate_contiguous(tensors: &[TinyTensor], dim: usize) -> Result<TinyTens
             // [b00, b01, [ b10, b11 ] ->]
             // new_data after extend:
             // [a00, a01, b00, b01, a10, a11, b10, b11]
-            let start = tensor.offset + outer_index * block_length;
+            let start = outer_index * block_length;
             let end = start + block_length;
 
-            new_data.extend(tensor.data.read().unwrap()[start..end].iter());
+            new_data.extend(tensor_data[start..end].iter().copied());
         }
     }
 
     Ok(TinyTensor {
         strides: new_stride,
+        shape: new_shape,
+        data: Arc::new(RwLock::new(new_data)),
+        offset: 0,
+    })
+}
+
+fn concatenate_on_zero_dimension(tensors: &[TinyTensor]) -> Result<TinyTensor> {
+    let new_shape = compute_new_shape_for_concatenation(tensors, 0);
+    let new_strides = TinyTensor::compute_strides(&new_shape);
+    let mut new_data = Vec::with_capacity(new_shape.iter().product::<usize>());
+
+    for tensor in tensors.iter() {
+        let tensor_data = make_contiguous_data(tensor.clone())?;
+
+        // Because dim = 0, each tensor is copied as one whole block.
+        let block_length = tensor_data.len();
+        let start = 0;
+        let end = start + block_length;
+
+        // Visualize concatenating on dimension 0:
+        //
+        // a & b, all shape in (2, 2)
+        //
+        // a flat data: [a00, a01, a10, a11]
+        // b flat data: [b00, b01, b10, b11]
+        //
+        // Dim: 0
+        // New Shape: (4, 2)
+        // New Stride: (2, 1)
+        // New Flat Data: [0, 0, 0, 0, 0, 0, 0, 0]
+        //
+        // Because dim = 0, each tensor is one whole block.
+        // It does not need to move row by row like dim = 1.
+        //
+        // For tensor a:
+        // block_length = a.shape[0] * a.shape[1] = 2 * 2 = 4
+        // start = 0
+        // end = 4
+        //
+        // With a block length of 4, it will move like:
+        // [ [ a00, a01, a10, a11 ] -> ]
+        //
+        // Then it will move the selected range of flat data to the new_data
+        // new_data after extend: [a00, a01, a10, a11]
+        //
+        // For tensor b:
+        // block_length = b.shape[0] * b.shape[1] = 2 * 2 = 4
+        // start = 0
+        // end = 4
+        //
+        // [ [ b00, b01, b10, b11 ] -> ]
+        // new_data after extend:
+        // [a00, a01, a10, a11, b00, b01, b10, b11]
+        new_data.extend(tensor_data[start..end].iter().copied());
+    }
+
+    Ok(TinyTensor {
+        strides: new_strides,
         shape: new_shape,
         data: Arc::new(RwLock::new(new_data)),
         offset: 0,
@@ -855,28 +910,53 @@ fn compute_new_shape_for_concatenation(tensors: &[TinyTensor], dim: usize) -> Ve
 }
 
 pub fn concatenate(a: &TinyTensor, b: &TinyTensor, dim: usize) -> Result<TinyTensor> {
-    Ok(TinyTensor {
-        inner: Tensor::cat(&[&a.inner, &b.inner], dim)?,
-    })
+    let tensors = [a.clone(), b.clone()];
+    concatenate_all(&tensors, dim)
 }
 
 pub fn concatenate_all(tensors: &[TinyTensor], dim: usize) -> Result<TinyTensor> {
-    Ok(TinyTensor {
-        inner: Tensor::cat(
-            &tensors
-                .iter()
-                .map(|item| &item.inner)
-                .collect::<Vec<&Tensor>>(),
-            dim,
-        )?,
-    })
+    if tensors.is_empty() {
+        return Err(anyhow!("No tensors to concatenate with"));
+    }
+
+    if dim >= tensors[0].rank() {
+        return Err(anyhow!("Dimension is out of bounds"));
+    }
+
+    for tensor in tensors.iter() {
+        if tensor.rank() != tensors[0].rank() {
+            return Err(anyhow!("Tensor rank mismatch during concatenation"));
+        }
+
+        for dimension_index in 0..tensors[0].rank() {
+            if dimension_index != dim
+                && tensor.shape[dimension_index] != tensors[0].shape[dimension_index]
+            {
+                return Err(anyhow!("Shape mismatch during concatenation"));
+            }
+        }
+    }
+
+    if tensors.len() == 1 {
+        return Ok(tensors[0].clone());
+    }
+
+    // Concatenating on dim 0 is the simple cat0 path: copy one whole tensor,
+    // then copy the next whole tensor, then copy the next whole tensor.
+    if dim == 0 {
+        return concatenate_on_zero_dimension(tensors);
+    }
+
+    // Concatenating on later dimensions needs the generic path: copy a small
+    // window from each tensor, then move to the next outer block.
+    concatenate_contiguous(tensors, dim)
 }
 
-// pub fn softmax(a: &TinyTensor) -> Result<TinyTensor> {
-//     Ok(TinyTensor {
-//         inner: candle_nn::ops::softmax_last_dim(&a.inner)?,
-//     })
-// }
+pub fn softmax(a: &TinyTensor) -> Result<TinyTensor> {
+    Ok(TinyTensor {
+        inner: candle_nn::ops::softmax_last_dim(&a.inner)?,
+    })
+}
 
 // pub fn square(a: &TinyTensor) -> Result<TinyTensor> {
 //     Ok(TinyTensor {
