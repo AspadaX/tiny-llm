@@ -952,10 +952,136 @@ pub fn concatenate_all(tensors: &[TinyTensor], dim: usize) -> Result<TinyTensor>
     concatenate_contiguous(tensors, dim)
 }
 
-pub fn softmax(a: &TinyTensor) -> Result<TinyTensor> {
-    Ok(TinyTensor {
-        inner: candle_nn::ops::softmax_last_dim(&a.inner)?,
-    })
+pub enum Reduction {
+    /// Calculate the max value of a given dimension of a tensor,
+    /// then reducing the given dimension to 1 with the only value being the max value.
+    Max,
+    Sum,
+}
+
+fn reduce_dim(tensor: &TinyTensor, operation: Reduction, dim: usize) -> Result<TinyTensor> {
+    if dim >= tensor.shape.len() {
+        return Err(anyhow!("Dimension exceeds the maximum"));
+    }
+
+    if tensor.shape[dim] == 0 {
+        return Err(anyhow!("Can't reduce empty dimensions"));
+    }
+
+    let mut new_shape: Vec<usize> = tensor.shape.clone();
+    new_shape[dim] = 1;
+
+    // For example,
+    // shape = [2, 2, 2]
+    // dim = 1
+    // data =
+    // [
+    //      [
+    //          [1, 2], [3, 4]
+    //      ],
+    //      [
+    //          [5, 6], [7, 8]
+    //      ],
+    // ]
+    //
+    // new shape = [2, 1, 2]
+    //
+    // iterater over all data (old shape):
+    // [0][0][0] = 1
+    // [0][0][1] = 2
+    // [0][1][0] = 3
+    // [0][1][1] = 4
+    // [1][0][0] = 5
+    // [1][0][1] = 6
+    // [1][1][0] = 7
+    // [1][1][1] = 8
+    //
+    // iterate over all data (new shape)
+    // [0][0][0] = 3
+    // [0][0][1] = 4
+    // [1][0][0] = 7
+    // [1][0][1] = 8
+
+    let new_data_length = new_shape.iter().product();
+    let mut new_data = Vec::with_capacity(new_data_length);
+    let old_data = tensor.data.read().unwrap();
+
+    for index in 0..new_data_length {
+        let base_offset =
+            compute_offset_from_linear_index(index, &new_shape, &tensor.strides, tensor.offset);
+
+        match operation {
+            Reduction::Max => {
+                inner_reduce_dim_to_max(tensor, dim, &mut new_data, &old_data, base_offset)
+            }
+            Reduction::Sum => {
+                inner_reduce_dim_to_sum(tensor, dim, &mut new_data, &old_data, base_offset)
+            }
+        }
+    }
+
+    Ok(TinyTensor::new(&new_data, &new_shape))
+}
+
+fn inner_reduce_dim_to_max(
+    tensor: &TinyTensor,
+    dim: usize,
+    new_data: &mut Vec<f32>,
+    old_data: &[f32],
+    base_offset: usize,
+) {
+    let mut max_value = old_data[base_offset];
+
+    for dim_index in 1..tensor.shape[dim] {
+        let old_data_offset = base_offset + tensor.strides[dim] * dim_index;
+        max_value = max_value.max(old_data[old_data_offset]);
+    }
+
+    new_data.push(max_value);
+}
+
+fn inner_reduce_dim_to_sum(
+    tensor: &TinyTensor,
+    dim: usize,
+    new_data: &mut Vec<f32>,
+    old_data: &[f32],
+    base_offset: usize,
+) {
+    let mut sum = 0.0;
+
+    for dim_index in 1..tensor.shape[dim] {
+        let old_data_offset = base_offset + tensor.strides[dim] * dim_index;
+        sum += old_data[old_data_offset];
+    }
+
+    new_data.push(sum);
+}
+
+pub fn compute_euler_exponential(tensor: TinyTensor) -> Result<TinyTensor> {
+    let old_data = tensor.data.read().unwrap();
+    let data_length = tensor.shape.iter().product();
+    let mut new_data = Vec::with_capacity(data_length);
+
+    for index in 0..data_length {
+        let old_data_offset =
+            compute_offset_from_linear_index(index, &tensor.shape, &tensor.strides, tensor.offset);
+        new_data.push(old_data[old_data_offset].exp());
+    }
+
+    Ok(TinyTensor::new(&new_data, &tensor.shape))
+}
+
+/// Normalizes elements along the specified dimension to values between 0 and 1.
+///
+/// The values along that dimension sum to 1, so they can be interpreted as
+/// probabilities.
+pub fn softmax(a: &TinyTensor, dim: usize) -> Result<TinyTensor> {
+    let max = reduce_dim(a, Reduction::Max, dim)?;
+    let shifted = broadcast_subtract(a, &max)?;
+    let exp = compute_euler_exponential(shifted)?;
+    let sum = reduce_dim(&exp, Reduction::Sum, dim)?;
+
+    broadcast_divide(&exp, &sum)
 }
 
 // pub fn square(a: &TinyTensor) -> Result<TinyTensor> {
