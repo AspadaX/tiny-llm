@@ -18,13 +18,17 @@ pub struct TinyTensor {
 }
 
 impl TinyTensor {
-    pub fn new(data: &[f32], shape: &[usize]) -> Self {
-        Self {
+    pub fn new_from_vec(data: Vec<f32>, shape: &[usize]) -> Result<Self> {
+        if data.len() != shape.iter().product::<usize>() {
+            return Err(anyhow!("Data length does not match shape"));
+        }
+
+        Ok(Self {
             strides: Self::compute_strides(shape),
             shape: shape.to_vec(),
-            data: Arc::new(RwLock::new(data.to_vec())),
+            data: Arc::new(RwLock::new(data)),
             offset: 0,
-        }
+        })
     }
 
     pub fn compute_strides(shape: &[usize]) -> Vec<usize> {
@@ -73,7 +77,7 @@ impl TinyTensor {
             _ => return Err(anyhow!("Data type {} unsupported", data_type)),
         };
 
-        Ok(Self::new(&data, shape))
+        Ok(Self::new_from_vec(data, shape)?)
     }
 
     /// `count_from_end` will be ignored for 0 dim index.
@@ -150,7 +154,7 @@ pub fn reshape(a: TinyTensor, shape: &[usize]) -> Result<TinyTensor> {
 
     if !a.is_contiguous() {
         let new_data = make_contiguous_data(a)?;
-        return Ok(TinyTensor::new(&new_data, shape));
+        return Ok(TinyTensor::new_from_vec(new_data, shape)?);
     }
 
     Ok(TinyTensor::new_without_reallocate(
@@ -176,7 +180,7 @@ pub fn reshape(a: TinyTensor, shape: &[usize]) -> Result<TinyTensor> {
 ///     For index_position in indexes:
 ///         start_i = outer_base + strides[dim] * indexes[i]
 ///         end_i = start_i + strides[dim]
-pub fn select_index(a: &TinyTensor, indexes: &TinyTensor, dim: usize) -> Result<TinyTensor> {
+pub fn select_index(indexes: &TinyTensor, a: &TinyTensor, dim: usize) -> Result<TinyTensor> {
     if dim >= a.rank() {
         return Err(anyhow!(
             "You should be using a valid dim index that is smaller than the tensor rank"
@@ -228,7 +232,7 @@ pub fn select_index(a: &TinyTensor, indexes: &TinyTensor, dim: usize) -> Result<
         }
     }
 
-    Ok(TinyTensor::new(&new_data, &new_shape))
+    Ok(TinyTensor::new_from_vec(new_data, &new_shape)?)
 }
 
 pub fn unsqueeze(mut a: TinyTensor, dim: usize) -> Result<TinyTensor> {
@@ -273,45 +277,6 @@ fn compute_bmnk(a: &TinyTensor, b: &TinyTensor) -> Result<(usize, usize, usize, 
     let k = a.shape[a.rank() - 1];
 
     Ok((batch, m, n, k))
-}
-
-/// Compute how many elements to move forward on the data array.
-///
-/// Supports tensors with rank 2 through 4, inclusive.
-///
-/// The left parameter indicates whether this is a left or right tensor.
-/// For example, in matrix multiplication, being left or right can alter the result.
-fn compute_skip(a: &TinyTensor, left: bool, m: usize, n: usize, k: usize) -> Result<usize> {
-    let batch_strides = &a.strides[..a.rank() - 2];
-
-    // This happens when having no batch strides
-    if batch_strides.is_empty() {
-        match left {
-            true => return Ok(m * k),
-            false => return Ok(n * k),
-        }
-    }
-
-    if batch_strides.len() == 1 {
-        // Directly return if it is a 3-D tensor.
-        return Ok(batch_strides[0]);
-    }
-
-    Ok(match batch_strides {
-        // If the dim shape at index 1 times the corresponding stride equal to the outer most dim's stride,
-        // we just need the stride at the index 1.
-        [stride_dim_zero, stride_dim_one] if *stride_dim_zero == stride_dim_one * a.shape[1] => {
-            *stride_dim_one
-        }
-        // Ignore the dims that are 1.
-        [stride_dim_zero, _] if a.shape[1] == 1 => *stride_dim_zero,
-        [_, stride_dim_one] if a.shape[0] == 1 => *stride_dim_one,
-        _ => {
-            return Err(anyhow!(
-                "Input tensor must not exceed 4-D nor lower than 2-D"
-            ));
-        }
-    })
 }
 
 // b, m, n, k
@@ -377,7 +342,7 @@ pub fn matrix_multiply(a: &TinyTensor, b: &TinyTensor) -> Result<TinyTensor> {
                 right_hand_side_column_stride as isize,
                 right_hand_side_row_stride as isize,
                 0.0,
-                0.0,
+                1.0,
                 false,
                 false,
                 false,
@@ -389,7 +354,7 @@ pub fn matrix_multiply(a: &TinyTensor, b: &TinyTensor) -> Result<TinyTensor> {
     let mut destination_shape = a.shape[..a.rank() - 2].to_vec();
     destination_shape.extend([m, n]);
 
-    Ok(TinyTensor::new(&destination, &destination_shape))
+    Ok(TinyTensor::new_from_vec(destination, &destination_shape)?)
 }
 
 /// Compute the new tensor's shape after a broadcasting computation.
@@ -594,7 +559,7 @@ where
         output_data.push(operation(a_data[offset_a], b_data[offset_b]));
     }
 
-    Ok(TinyTensor::new(&output_data, &broadcasted_shape))
+    Ok(TinyTensor::new_from_vec(output_data, &broadcasted_shape)?)
 }
 
 pub fn broadcast_add(a: &TinyTensor, b: &TinyTensor) -> Result<TinyTensor> {
@@ -957,6 +922,7 @@ pub enum Reduction {
     /// then reducing the given dimension to 1 with the only value being the max value.
     Max,
     Sum,
+    ArgMax,
 }
 
 fn reduce_dim(tensor: &TinyTensor, operation: Reduction, dim: usize) -> Result<TinyTensor> {
@@ -1017,10 +983,13 @@ fn reduce_dim(tensor: &TinyTensor, operation: Reduction, dim: usize) -> Result<T
             Reduction::Sum => {
                 inner_reduce_dim_to_sum(tensor, dim, &mut new_data, &old_data, base_offset)
             }
+            Reduction::ArgMax => {
+                inner_reduce_dim_to_argmax(tensor, dim, &mut new_data, &old_data, base_offset)
+            }
         }
     }
 
-    Ok(TinyTensor::new(&new_data, &new_shape))
+    Ok(TinyTensor::new_from_vec(new_data, &new_shape)?)
 }
 
 fn inner_reduce_dim_to_max(
@@ -1047,7 +1016,7 @@ fn inner_reduce_dim_to_sum(
     old_data: &[f32],
     base_offset: usize,
 ) {
-    let mut sum = 0.0;
+    let mut sum = old_data[base_offset];
 
     for dim_index in 1..tensor.shape[dim] {
         let old_data_offset = base_offset + tensor.strides[dim] * dim_index;
@@ -1057,7 +1026,40 @@ fn inner_reduce_dim_to_sum(
     new_data.push(sum);
 }
 
-pub fn compute_euler_exponential(tensor: TinyTensor) -> Result<TinyTensor> {
+/// Finds the index of the maximum value along `dim`.
+fn inner_reduce_dim_to_argmax(
+    tensor: &TinyTensor,
+    dim: usize,
+    new_data: &mut Vec<f32>,
+    old_data: &[f32],
+    base_offset: usize,
+) {
+    let mut max_value = (0, old_data[base_offset]);
+
+    for dim_index in 1..tensor.shape[dim] {
+        let old_data_offset = base_offset + tensor.strides[dim] * dim_index;
+        let old_data_value = old_data[old_data_offset];
+        if old_data_value > max_value.1 {
+            max_value = (dim_index, old_data_value)
+        }
+    }
+
+    new_data.push(max_value.0 as f32);
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum UnaryOperation {
+    EulerExponential,
+    Square,
+    SquareRoot,
+    MultiplyScalar(f32),
+    Silu,
+}
+
+pub fn compute_unary_operations(
+    tensor: TinyTensor,
+    unary_operation: UnaryOperation,
+) -> Result<TinyTensor> {
     let old_data = tensor.data.read().unwrap();
     let data_length = tensor.shape.iter().product();
     let mut new_data = Vec::with_capacity(data_length);
@@ -1065,10 +1067,25 @@ pub fn compute_euler_exponential(tensor: TinyTensor) -> Result<TinyTensor> {
     for index in 0..data_length {
         let old_data_offset =
             compute_offset_from_linear_index(index, &tensor.shape, &tensor.strides, tensor.offset);
-        new_data.push(old_data[old_data_offset].exp());
+
+        let result = match unary_operation {
+            UnaryOperation::EulerExponential => old_data[old_data_offset].exp(),
+            UnaryOperation::Square => old_data[old_data_offset] * old_data[old_data_offset],
+            UnaryOperation::SquareRoot => old_data[old_data_offset].sqrt(),
+            UnaryOperation::MultiplyScalar(scale) => old_data[old_data_offset] * scale,
+            UnaryOperation::Silu => {
+                old_data[old_data_offset] / (1.0 + (-old_data[old_data_offset]).exp())
+            }
+        };
+
+        new_data.push(result)
     }
 
-    Ok(TinyTensor::new(&new_data, &tensor.shape))
+    Ok(TinyTensor::new_from_vec(new_data, &tensor.shape)?)
+}
+
+pub fn compute_euler_exponential(tensor: TinyTensor) -> Result<TinyTensor> {
+    compute_unary_operations(tensor, UnaryOperation::EulerExponential)
 }
 
 /// Normalizes elements along the specified dimension to values between 0 and 1.
@@ -1084,66 +1101,76 @@ pub fn softmax(a: &TinyTensor, dim: usize) -> Result<TinyTensor> {
     broadcast_divide(&exp, &sum)
 }
 
-// pub fn square(a: &TinyTensor) -> Result<TinyTensor> {
-//     Ok(TinyTensor {
-//         inner: a.inner.sqr()?,
-//     })
-// }
+pub fn square(a: TinyTensor) -> Result<TinyTensor> {
+    compute_unary_operations(a, UnaryOperation::Square)
+}
 
-// pub fn mean<D>(a: &TinyTensor, dim: D) -> Result<TinyTensor>
-// where
-//     D: Dim,
-// {
-//     Ok(TinyTensor {
-//         inner: a.inner.mean_keepdim(dim)?,
-//     })
-// }
+pub fn square_root(a: TinyTensor) -> Result<TinyTensor> {
+    compute_unary_operations(a, UnaryOperation::SquareRoot)
+}
 
-// pub fn square_root(a: &TinyTensor) -> Result<TinyTensor> {
-//     Ok(TinyTensor {
-//         inner: a.inner.sqrt()?,
-//     })
-// }
+pub fn argmax(a: &TinyTensor, dim: usize) -> Result<TinyTensor> {
+    reduce_dim(a, Reduction::ArgMax, dim)
+}
 
-// pub fn silu(a: &TinyTensor) -> Result<TinyTensor> {
-//     Ok(TinyTensor {
-//         inner: a.inner.silu()?,
-//     })
-// }
+/// Computes the mean across the specified dimensions,
+/// retaining reduced dimensions with size `1`.
+pub fn mean(a: &TinyTensor, dims: &[usize]) -> Result<TinyTensor> {
+    let mut reduced_dimension_count: usize = 1;
+    let mut seen_dimensions: Vec<bool> = vec![false; a.rank()];
+    let mut result = a.clone();
 
-// pub fn argmax(a: &TinyTensor, dim: usize) -> Result<TinyTensor> {
-//     Ok(TinyTensor {
-//         inner: a.inner.argmax(dim)?,
-//     })
-// }
+    for dim in dims {
+        if *dim >= a.rank() {
+            return Err(anyhow!("Dimension cannot exceed the rank"));
+        }
 
-// pub fn repeat(a: &TinyTensor, shape: impl Into<Shape>) -> Result<TinyTensor> {
-//     Ok(TinyTensor {
-//         inner: a.inner.repeat(shape)?,
-//     })
-// }
+        if seen_dimensions[*dim] {
+            return Err(anyhow!("Duplicated dimension found"));
+        }
 
-// pub fn repeat_kv(a: &TinyTensor, n_repetition: usize) -> Result<TinyTensor> {
-//     if a.get_shape().dims().len() != 4 {
-//         return Err(anyhow!("Input tensor for kv repetition must be rank 4"));
-//     }
+        seen_dimensions[*dim] = true;
 
-//     let shape = a.get_shape();
-//     let (batch_size, num_kv_heads, sequence_length, head_dim) =
-//         (shape.dim(0)?, shape.dim(1)?, shape.dim(2)?, shape.dim(3)?);
+        reduced_dimension_count *= a.shape[*dim];
 
-//     // Add a new dim after dim 0, 1 for storing repetition number
-//     let new_a = unsqueeze(a, 2)?;
+        result = reduce_dim(&result, Reduction::Sum, *dim)?;
+    }
 
-//     let repeated = repeat(&new_a, (1, 1, n_repetition, 1, 1))?;
+    let scale: f32 = 1.0 / reduced_dimension_count as f32;
 
-//     Ok(reshape(
-//         &repeated,
-//         (
-//             batch_size,
-//             n_repetition * num_kv_heads,
-//             sequence_length,
-//             head_dim,
-//         ),
-//     )?)
-// }
+    compute_unary_operations(result, UnaryOperation::MultiplyScalar(scale))
+}
+
+/// Paper: https://arxiv.org/pdf/1702.03118
+pub fn silu(a: TinyTensor) -> Result<TinyTensor> {
+    compute_unary_operations(a, UnaryOperation::Silu)
+}
+
+/// In PyTorch, it does not allow repeats to be lower rank than the tensor.
+/// However, in Candle, this is allowed.
+///
+/// This implementation decided to follow the PyTorch way.
+pub fn repeat(a: &TinyTensor, repeats: &[usize]) -> Result<TinyTensor> {
+    if repeats.len() < a.rank() {
+        return Err(anyhow!(
+            "the number of repeat dimensions must be at least the tensor rank"
+        ));
+    }
+
+    let mut tensor = if repeats.len() > a.rank() {
+        reshape(
+            a.clone(),
+            &[vec![1; repeats.len() - a.rank()], a.shape.to_owned()].concat(),
+        )?
+    } else {
+        a.clone()
+    };
+
+    for (index, repeat) in repeats.iter().enumerate() {
+        if *repeat > 1 {
+            tensor = concatenate_all(&vec![tensor; *repeat], index)?;
+        }
+    }
+
+    Ok(tensor)
+}
