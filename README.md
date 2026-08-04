@@ -40,6 +40,8 @@ For tensor operations, please refer to [tensors.rs](./src/tensors.rs).
 
 The `main` branch contains my hand-written version of tiny-llm. If you would like to have a look at the one based on candle, please refer to `candle-based-implementation` branch.
 
+For now, TinyTensor's performance is slower than that of canlde. I am still optimizing it. Stay tuned.
+
 ## Getting Started
 
 ### 1. Download the model
