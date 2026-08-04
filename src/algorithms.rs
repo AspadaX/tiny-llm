@@ -148,6 +148,7 @@ pub fn compute_rotary_position_embeddings(
     Ok(concatenate(&x, &y, last_dimension)?)
 }
 
+#[allow(dead_code)]
 pub fn prepare_rope_for_this_step(
     current_position: usize,
     current_sequence_length: usize,
@@ -242,6 +243,7 @@ pub fn create_attention_mask(max_sequence_len: usize) -> Result<TinyTensor> {
     )?)
 }
 
+#[allow(dead_code)]
 pub fn compute_current_attention_mask(
     attention_mask: &TinyTensor,
     current_token_position: usize,

@@ -578,6 +578,7 @@ pub fn broadcast_subtract(a: &TinyTensor, b: &TinyTensor) -> Result<TinyTensor> 
     perform_broadcast_binary_operation(a, b, |a, b| a - b)
 }
 
+#[allow(dead_code)]
 pub fn broadcast_matrix_multiply(a: &TinyTensor, b: &TinyTensor) -> Result<TinyTensor> {
     if a.rank() < 2 || b.rank() < 2 {
         return Err(anyhow!(

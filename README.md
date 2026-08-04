@@ -12,16 +12,18 @@ A minimal LLM inference engine for [MiniCPM5-1B](https://huggingface.co/openbmb/
 
 I built this project to study the fundamentals of large language models. Every understanding is rephrased directly in the code — dense, but organized. My hope is that it helps you learn too.
 
-Inspired by [tiny-vllm](https://github.com/kuawo/tiny-llm).
+Inspired by [tiny-vllm](https://github.com/kuawo/tiny-llm). Coded with love. 💗
 
 ## Features
 
 - **CPU-only inference** — no GPU required
 - **No KV-cache** — focuses on the core model mechanics
-- **Single-file implementation** — `src/main.rs` (~1800 lines)
 - **TUI visualization** — real-time view of how the model "thinks"
+- **Hand-written algorithms and tensor operations** - I hand written the algorithms and tensor ops. Thanks to `candle` for their tensor implementations. I learned a lot from their codebase.
 
 ### What's implemented
+
+Below are the algorithms I implemented for tiny-llm:
 
 | Component            | Details                                                 |
 | -------------------- | ------------------------------------------------------- |
@@ -31,6 +33,12 @@ Inspired by [tiny-vllm](https://github.com/kuawo/tiny-llm).
 | MLP                  | SwiGLU activation function                              |
 | Normalization        | RMSNorm                                                 |
 | Residual connections | Standard skip connections after attention and MLP       |
+
+Please refer to [algorithms.rs](./src/algorithms.rs) for codes.
+
+For tensor operations, please refer to [tensors.rs](./src/tensors.rs).
+
+The `main` branch contains my hand-written version of tiny-llm. If you would like to have a look at the one based on candle, please refer to `candle-based-implementation` branch.
 
 ## Getting Started
 
@@ -61,12 +69,11 @@ Press `q` to quit early.
 
 ## Code Walkthrough
 
-The best way to read this code is top-to-bottom in `src/main.rs`:
-
-1. **Tensor ops** — A minimal `TinyTensor` wrapper over candle tensors with matrix multiply, reshape, transpose, softmax, etc. I will try to write the Maths operations by hand.
-2. **Model loading** — `ModelConfigurations`, `LlamaModel`, and `TransformerBlock` structs that map directly to the safetensors keys.
-3. **`predict_next_token`** — The inference loop through every transformer layer. Each operation is annotated with shape comments and timing.
-4. **TUI** — Ratatui widgets render attention maps, tensor shapes, and logits in real time.
+1. **`src/tensors.rs`** — The handwritten `TinyTensor` type and basic tensor operations.
+2. **`src/algorithms.rs`** — LLM operations such as RMSNorm, RoPE, attention, and SwiGLU.
+3. **`src/main.rs`** — Model loading and the `predict_next_token` inference flow.
+4. **`src/tui.rs`** — The terminal UI, attention heatmaps, and candidate logits.
+5. **`src/benchmark.rs`** — Live latency, throughput, and operation timing statistics.
 
 ## License
 

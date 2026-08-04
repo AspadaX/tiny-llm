@@ -1,28 +1,16 @@
-pub mod algorithms;
-pub mod tensors;
+mod algorithms;
+mod benchmark;
+mod tensors;
+mod tui;
 
 use std::{
     f32,
-    io::{self, Stdout},
     path::{Path, PathBuf},
     str::FromStr,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use anyhow::{Result, anyhow};
-use crossterm::{
-    event::{self, Event, KeyCode},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
-use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
-};
 use safetensors::SafeTensors;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -34,9 +22,14 @@ use crate::{
         compute_rotary_position_embeddings, compute_swiglu, create_attention_mask,
         precompute_theta_tables,
     },
+    benchmark::{CompletionReason, InferenceStats, TensorFlowStep},
     tensors::{
-        TinyTensor, argmax, broadcast_add, broadcast_divide, make_contiguous_data, matrix_multiply,
-        narrow, reshape, select_index, softmax, transpose, transpose_with_dim, unsqueeze,
+        TinyTensor, argmax, broadcast_add, narrow, reshape, select_index, transpose_with_dim,
+        unsqueeze,
+    },
+    tui::{
+        InferenceDebugState, TerminalSession, build_attention_heatmaps,
+        collect_top_candidate_logits, should_quit,
     },
 };
 
@@ -260,97 +253,14 @@ impl LlamaModel {
     }
 }
 
-/*
- * Start of UI Logics
- */
-
-#[derive(Clone, Debug)]
-struct TensorFlowStep {
-    layer_index: Option<usize>,
-    step_name: String,
-    input_shape: Vec<usize>,
-    output_shape: Vec<usize>,
-    elapsed: Duration,
-}
-
-#[derive(Clone, Debug)]
-struct CandidateLogit {
-    token_id: u32,
-    decoded_text: String,
-    logit: f32,
-}
-
-#[derive(Clone, Debug)]
-struct AttentionHeatmapSnapshot {
-    layer_index: usize,
-    head_index: usize,
-    values: Vec<Vec<f32>>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct InferenceDebugState {
-    prompt: String,
-    generated_text: String,
-    current_token_id: Option<u32>,
-    current_token_text: String,
-    tensor_flow_steps: Vec<TensorFlowStep>,
-    attention_heatmaps: Vec<AttentionHeatmapSnapshot>,
-    candidate_logits: Vec<CandidateLogit>,
-}
-
 struct PredictionResult {
     next_token: u32,
     debug_state: InferenceDebugState,
-}
-
-type DebugTerminal = Terminal<CrosstermBackend<Stdout>>;
-
-struct TerminalSession {
-    terminal: DebugTerminal,
-}
-
-impl TerminalSession {
-    fn start() -> Result<Self> {
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
-        let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-
-        Ok(Self { terminal })
-    }
-
-    fn draw(&mut self, debug_state: &InferenceDebugState) -> Result<()> {
-        self.terminal
-            .draw(|frame| render_inference_debugger(frame, debug_state))?;
-        Ok(())
-    }
-}
-
-impl Drop for TerminalSession {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
-        let _ = self.terminal.show_cursor();
-    }
-}
-
-fn shape_to_string(shape: &[usize]) -> String {
-    format!(
-        "[{}]",
-        shape
-            .iter()
-            .map(usize::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
+    visualization_overhead: std::time::Duration,
 }
 
 fn tensor_shape(tensor: &TinyTensor) -> Vec<usize> {
     tensor.get_shape().to_vec()
-}
-
-fn elapsed_ms(duration: Duration) -> f64 {
-    duration.as_secs_f64() * 1000.0
 }
 
 fn record_tensor_flow_step(
@@ -368,350 +278,6 @@ fn record_tensor_flow_step(
         output_shape,
         elapsed: started_at.elapsed(),
     });
-}
-
-fn should_quit_tui() -> Result<bool> {
-    if event::poll(Duration::from_millis(1))? {
-        if let Event::Key(key_event) = event::read()? {
-            return Ok(matches!(key_event.code, KeyCode::Char('q') | KeyCode::Esc));
-        }
-    }
-
-    Ok(false)
-}
-
-fn render_inference_debugger(frame: &mut ratatui::Frame, debug_state: &InferenceDebugState) {
-    let root = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(7),
-            Constraint::Min(12),
-            Constraint::Length(10),
-        ])
-        .split(frame.area());
-
-    render_generated_text(frame, root[0], debug_state);
-
-    let middle = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-        .split(root[1]);
-
-    render_attention_heatmap(frame, middle[0], debug_state);
-    render_candidate_logits(frame, middle[1], debug_state);
-    render_tensor_flow(frame, root[2], debug_state);
-}
-
-fn render_generated_text(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    debug_state: &InferenceDebugState,
-) {
-    let status_line = Line::from(vec![
-        Span::styled(
-            "q / Esc",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" quit  "),
-        Span::styled("token", Style::default().fg(Color::Cyan)),
-        Span::raw(format!(" {:?} ", debug_state.current_token_id)),
-        Span::styled(
-            debug_state.current_token_text.clone(),
-            Style::default().fg(Color::Green),
-        ),
-    ]);
-
-    let text = vec![
-        status_line,
-        Line::from(vec![
-            Span::styled("Prompt: ", Style::default().fg(Color::Magenta)),
-            Span::raw(debug_state.prompt.clone()),
-        ]),
-        Line::from(vec![
-            Span::styled("Generated: ", Style::default().fg(Color::Cyan)),
-            Span::raw(debug_state.generated_text.clone()),
-        ]),
-    ];
-
-    let paragraph = Paragraph::new(text)
-        .block(
-            Block::default()
-                .title(" MiniCPM inference debugger ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Blue)),
-        )
-        .wrap(Wrap { trim: false });
-
-    frame.render_widget(paragraph, area);
-}
-
-fn render_attention_heatmap(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    debug_state: &InferenceDebugState,
-) {
-    if debug_state.attention_heatmaps.is_empty() {
-        let paragraph = Paragraph::new("attention values are not available yet").block(
-            Block::default()
-                .title(" Attention heatmaps ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red)),
-        );
-        frame.render_widget(paragraph, area);
-        return;
-    };
-
-    let heatmap_count = debug_state.attention_heatmaps.len();
-    let columns = (heatmap_count as f64).sqrt().ceil() as usize;
-    let rows = heatmap_count.div_ceil(columns);
-    let row_constraints = vec![Constraint::Ratio(1, rows as u32); rows];
-    let row_areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(row_constraints)
-        .split(area);
-
-    for row_index in 0..rows {
-        let start = row_index * columns;
-        let end = usize::min(start + columns, heatmap_count);
-        let column_count = end - start;
-        let column_constraints = vec![Constraint::Ratio(1, column_count as u32); column_count];
-        let column_areas = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(column_constraints)
-            .split(row_areas[row_index]);
-
-        for (column_index, heatmap) in debug_state.attention_heatmaps[start..end]
-            .iter()
-            .enumerate()
-        {
-            render_single_attention_heatmap(frame, column_areas[column_index], heatmap);
-        }
-    }
-}
-
-fn render_single_attention_heatmap(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    heatmap: &AttentionHeatmapSnapshot,
-) {
-    let mut lines = Vec::new();
-
-    for row in heatmap
-        .values
-        .iter()
-        .rev()
-        .take(area.height.saturating_sub(2) as usize)
-        .rev()
-    {
-        let spans = row
-            .iter()
-            .take(area.width.saturating_sub(2) as usize)
-            .map(|value| attention_value_span(*value));
-        lines.push(Line::from(spans.collect::<Vec<_>>()));
-    }
-
-    let paragraph = Paragraph::new(lines).block(
-        Block::default()
-            .title(format!(
-                " L{} H{} ",
-                heatmap.layer_index, heatmap.head_index
-            ))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Magenta)),
-    );
-
-    frame.render_widget(paragraph, area);
-}
-
-fn attention_value_span(value: f32) -> Span<'static> {
-    let (symbol, color) = if value < 0.05 {
-        ("░", Color::DarkGray)
-    } else if value < 0.15 {
-        ("▒", Color::Blue)
-    } else if value < 0.35 {
-        ("▓", Color::Cyan)
-    } else if value < 0.65 {
-        ("█", Color::Yellow)
-    } else {
-        ("█", Color::Red)
-    };
-
-    Span::styled(symbol, Style::default().fg(color))
-}
-
-fn render_candidate_logits(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    debug_state: &InferenceDebugState,
-) {
-    let rows = debug_state.candidate_logits.iter().map(|candidate| {
-        Row::new(vec![
-            Cell::from(candidate.token_id.to_string()).style(Style::default().fg(Color::Cyan)),
-            Cell::from(candidate.decoded_text.replace('\n', "\\n"))
-                .style(Style::default().fg(Color::Green)),
-            Cell::from(format!("{:.3}", candidate.logit)).style(Style::default().fg(Color::Yellow)),
-        ])
-    });
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(8),
-            Constraint::Min(8),
-            Constraint::Length(12),
-        ],
-    )
-    .header(
-        Row::new(vec!["token", "text", "logit"]).style(
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ),
-    )
-    .block(
-        Block::default()
-            .title(" Candidate logits ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Green)),
-    );
-
-    frame.render_widget(table, area);
-}
-
-fn render_tensor_flow(frame: &mut ratatui::Frame, area: Rect, debug_state: &InferenceDebugState) {
-    let visible_rows = area.height.saturating_sub(3) as usize;
-    let steps = debug_state
-        .tensor_flow_steps
-        .iter()
-        .rev()
-        .take(visible_rows)
-        .collect::<Vec<_>>();
-
-    let rows = steps.into_iter().rev().map(|step| {
-        let layer = step
-            .layer_index
-            .map_or("global".to_string(), |index| format!("layer {index}"));
-        Row::new(vec![
-            Cell::from(layer).style(Style::default().fg(Color::Blue)),
-            Cell::from(step.step_name.clone()).style(Style::default().fg(Color::Cyan)),
-            Cell::from(shape_to_string(&step.input_shape))
-                .style(Style::default().fg(Color::DarkGray)),
-            Cell::from("→").style(
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Cell::from(shape_to_string(&step.output_shape))
-                .style(Style::default().fg(Color::Green)),
-            Cell::from(format!("{:.2} ms", elapsed_ms(step.elapsed)))
-                .style(Style::default().fg(Color::Yellow)),
-        ])
-    });
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(9),
-            Constraint::Length(20),
-            Constraint::Percentage(25),
-            Constraint::Length(2),
-            Constraint::Percentage(25),
-            Constraint::Length(12),
-        ],
-    )
-    .header(
-        Row::new(vec!["layer", "step", "input", "", "output", "time"]).style(
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ),
-    )
-    .block(
-        Block::default()
-            .title(" Tensor shape flow ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow)),
-    );
-
-    frame.render_widget(table, area);
-}
-
-fn tiny_tensor_to_f32_vec(tensor: &TinyTensor) -> Result<Vec<f32>> {
-    make_contiguous_data(tensor.clone())
-}
-
-fn collect_top_candidate_logits(
-    logits: &TinyTensor,
-    tokenizer: &Tokenizer,
-    top_k: usize,
-) -> Result<Vec<CandidateLogit>> {
-    let flattened_logits = tiny_tensor_to_f32_vec(logits)?;
-    let mut indexed_logits = flattened_logits
-        .iter()
-        .enumerate()
-        .map(|(token_id, logit)| (token_id as u32, *logit))
-        .collect::<Vec<_>>();
-
-    indexed_logits.sort_by(|(_, left), (_, right)| {
-        right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    Ok(indexed_logits
-        .into_iter()
-        .take(top_k)
-        .map(|(token_id, logit)| CandidateLogit {
-            token_id,
-            decoded_text: tokenizer
-                .decode(&[token_id], false)
-                .unwrap_or_else(|_| "<?>".to_string()),
-            logit,
-        })
-        .collect())
-}
-
-fn build_attention_heatmaps(
-    layer_index: usize,
-    q: &TinyTensor,
-    k: &TinyTensor,
-    attention_mask: &TinyTensor,
-) -> Result<Vec<AttentionHeatmapSnapshot>> {
-    let square_root_k_dimension = k.get_shape()[k.rank() - 1] as f32;
-    let tensor_sqrt_k_dimension =
-        TinyTensor::new_from_vec(vec![square_root_k_dimension.sqrt()], &[1])?;
-    let q_k = matrix_multiply(q, &transpose(k.clone())?)?;
-    let divided = broadcast_divide(&q_k, &tensor_sqrt_k_dimension)?;
-    let applied_attention_mask = broadcast_add(&divided, attention_mask)?;
-    let softmaxed = softmax(&applied_attention_mask, applied_attention_mask.rank() - 1)?;
-
-    let shape = softmaxed.get_shape();
-    let num_heads = shape[1];
-    let sequence_length = shape[2];
-    let all_attention_values = tiny_tensor_to_f32_vec(&softmaxed)?;
-    let mut heatmaps = Vec::with_capacity(num_heads);
-
-    for head_index in 0..num_heads {
-        let mut values = Vec::with_capacity(sequence_length);
-
-        for query_position in 0..sequence_length {
-            let mut row = Vec::with_capacity(sequence_length);
-            for key_position in 0..sequence_length {
-                let index = ((head_index * sequence_length + query_position) * sequence_length)
-                    + key_position;
-                row.push(all_attention_values.get(index).copied().unwrap_or(0.0));
-            }
-            values.push(row);
-        }
-
-        heatmaps.push(AttentionHeatmapSnapshot {
-            layer_index,
-            head_index,
-            values,
-        });
-    }
-
-    Ok(heatmaps)
 }
 
 /*
@@ -747,6 +313,7 @@ fn predict_next_token(
     generated_text: &str,
     input_token_ids: &[u32],
 ) -> Result<PredictionResult, anyhow::Error> {
+    let mut visualization_overhead = std::time::Duration::ZERO;
     let mut debug_state = InferenceDebugState {
         prompt: prompt.to_string(),
         generated_text: generated_text.to_string(),
@@ -1070,8 +637,10 @@ fn predict_next_token(
             }
 
             if index == model_configurations.num_hidden_layers.saturating_sub(1) {
+                let visualization_started_at = Instant::now();
                 debug_state.attention_heatmaps =
                     build_attention_heatmaps(index, &q, &k, &attention_mask)?;
+                visualization_overhead += visualization_started_at.elapsed();
             }
 
             let attention_started_at = Instant::now();
@@ -1185,7 +754,9 @@ fn predict_next_token(
         tensor_shape(&logits),
         logits_started_at,
     );
+    let visualization_started_at = Instant::now();
     debug_state.candidate_logits = collect_top_candidate_logits(&logits, tokenizer, 10)?;
+    visualization_overhead += visualization_started_at.elapsed();
 
     let argmax = argmax(&logits, 2)?;
 
@@ -1194,6 +765,7 @@ fn predict_next_token(
     Ok(PredictionResult {
         next_token,
         debug_state,
+        visualization_overhead,
     })
 }
 
@@ -1237,12 +809,15 @@ fn main() -> Result<()> {
 
     let mut input_token_ids = tokens.get_ids().to_vec();
     let mut generated_text = String::new();
+    let mut stats = InferenceStats::new(input_token_ids.len());
     let mut terminal_session = TerminalSession::start()?;
 
     // An LLM predicts the next token from the input text, one token at a time.
     // Since we want a full response rather than a single token, we keep generating
     // tokens until the model emits an end-of-sequence token.
     loop {
+        let context_length = input_token_ids.len();
+        let inference_started_at = Instant::now();
         let mut prediction = predict_next_token(
             &model_configurations,
             &llama_model,
@@ -1251,6 +826,19 @@ fn main() -> Result<()> {
             &generated_text,
             &input_token_ids,
         )?;
+        let inference_duration = inference_started_at
+            .elapsed()
+            .saturating_sub(prediction.visualization_overhead);
+        let is_eos = model_configurations
+            .eos_token_id
+            .contains(&prediction.next_token);
+
+        stats.record_prediction(
+            context_length,
+            inference_duration,
+            !is_eos,
+            &prediction.debug_state.tensor_flow_steps,
+        );
 
         // Append the generated token to the "context"
         input_token_ids.push(prediction.next_token);
@@ -1259,24 +847,27 @@ fn main() -> Result<()> {
         prediction.debug_state.current_token_id = Some(prediction.next_token);
         prediction.debug_state.current_token_text = word.clone();
 
-        // Exit when the model says done
-        if model_configurations
-            .eos_token_id
-            .contains(&prediction.next_token)
-        {
+        if is_eos {
+            stats.finish(CompletionReason::EndOfSequence);
             prediction.debug_state.generated_text = generated_text.clone();
+            prediction.debug_state.benchmark = stats.snapshot();
             terminal_session.draw(&prediction.debug_state)?;
             break;
         }
 
         generated_text.push_str(&word);
         prediction.debug_state.generated_text = generated_text.clone();
+        prediction.debug_state.benchmark = stats.snapshot();
         terminal_session.draw(&prediction.debug_state)?;
 
-        if should_quit_tui()? {
+        if should_quit()? {
+            stats.finish(CompletionReason::UserInterrupted);
             break;
         }
     }
+
+    drop(terminal_session);
+    println!("{stats}");
 
     Ok(())
 }
