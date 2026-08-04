@@ -10,7 +10,9 @@ A minimal LLM inference engine for [MiniCPM5-1B](https://huggingface.co/openbmb/
   <img src="./assets/demo.gif" width="1080">
 </p>
 
-I built this project to study the fundamentals of large language models. Every understanding is rephrased directly in the code — dense, but organized. My hope is that it helps you learn too.
+I built this project to study the fundamentals of large language models. Every understanding is rephrased directly in the code. My hope is that it helps you learn too.
+
+This is also a preparation for integrating AI algorithms and technologies into my note app [OpenNote](https://github.com/opennote-org/opennote).
 
 Inspired by [tiny-vllm](https://github.com/kuawo/tiny-llm). Coded with love. 💗
 
