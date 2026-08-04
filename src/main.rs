@@ -1,3 +1,5 @@
+mod benchmark;
+
 use std::{
     f32,
     io::{self, Stdout},
@@ -26,6 +28,10 @@ use safetensors::{Dtype, SafeTensors};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use tokenizers::Tokenizer;
+
+use benchmark::{
+    CompletionReason, InferenceStats, InferenceStatsSnapshot, TensorFlowStep, format_duration,
+};
 
 /*
  * Start of math computations
@@ -873,15 +879,6 @@ pub fn broadcast_matrix_multiply(a: &TinyTensor, b: &TinyTensor) -> Result<TinyT
  */
 
 #[derive(Clone, Debug)]
-struct TensorFlowStep {
-    layer_index: Option<usize>,
-    step_name: String,
-    input_shape: Vec<usize>,
-    output_shape: Vec<usize>,
-    elapsed: Duration,
-}
-
-#[derive(Clone, Debug)]
 struct CandidateLogit {
     token_id: u32,
     decoded_text: String,
@@ -904,11 +901,13 @@ struct InferenceDebugState {
     tensor_flow_steps: Vec<TensorFlowStep>,
     attention_heatmaps: Vec<AttentionHeatmapSnapshot>,
     candidate_logits: Vec<CandidateLogit>,
+    benchmark: InferenceStatsSnapshot,
 }
 
 struct PredictionResult {
     next_token: u32,
     debug_state: InferenceDebugState,
+    visualization_overhead: Duration,
 }
 
 type DebugTerminal = Terminal<CrosstermBackend<Stdout>>;
@@ -989,11 +988,13 @@ fn should_quit_tui() -> Result<bool> {
 }
 
 fn render_inference_debugger(frame: &mut ratatui::Frame, debug_state: &InferenceDebugState) {
+    let benchmark_height = if frame.area().width >= 120 { 7 } else { 12 };
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(7),
             Constraint::Min(12),
+            Constraint::Length(benchmark_height),
             Constraint::Length(10),
         ])
         .split(frame.area());
@@ -1007,7 +1008,8 @@ fn render_inference_debugger(frame: &mut ratatui::Frame, debug_state: &Inference
 
     render_attention_heatmap(frame, middle[0], debug_state);
     render_candidate_logits(frame, middle[1], debug_state);
-    render_tensor_flow(frame, root[2], debug_state);
+    render_benchmark(frame, root[2], &debug_state.benchmark);
+    render_tensor_flow(frame, root[3], debug_state);
 }
 
 fn render_generated_text(
@@ -1053,6 +1055,129 @@ fn render_generated_text(
         .wrap(Wrap { trim: false });
 
     frame.render_widget(paragraph, area);
+}
+
+fn render_benchmark(frame: &mut ratatui::Frame, area: Rect, benchmark: &InferenceStatsSnapshot) {
+    let card_areas = benchmark_card_areas(area);
+
+    render_metric_card(
+        frame,
+        card_areas[0],
+        " Session ",
+        Color::Blue,
+        vec![
+            metric_line("Steps", benchmark.steps.to_string(), Color::Cyan),
+            metric_line("Tokens", benchmark.emitted_tokens.to_string(), Color::Green),
+            metric_line(
+                "Context",
+                format!("{} tok", benchmark.context_length),
+                Color::Magenta,
+            ),
+            metric_line("Elapsed", format_duration(benchmark.total), Color::Yellow),
+        ],
+    );
+    render_metric_card(
+        frame,
+        card_areas[1],
+        " Latency ",
+        Color::Yellow,
+        vec![
+            metric_line("Last", format_duration(benchmark.last), Color::Yellow),
+            metric_line("Average", format_duration(benchmark.average), Color::Cyan),
+            metric_line(
+                "TTFT",
+                format_duration(benchmark.time_to_first_token),
+                Color::Green,
+            ),
+        ],
+    );
+    render_metric_card(
+        frame,
+        card_areas[2],
+        " Throughput ",
+        Color::Green,
+        vec![
+            metric_line(
+                "Overall",
+                format!("{:.2} tok/s", benchmark.overall_tokens_per_second),
+                Color::Green,
+            ),
+            metric_line(
+                "Latest 5",
+                format!("{:.2} tok/s", benchmark.rolling_tokens_per_second),
+                Color::LightGreen,
+            ),
+        ],
+    );
+    render_metric_card(
+        frame,
+        card_areas[3],
+        " Distribution ",
+        Color::Magenta,
+        vec![
+            metric_line("P50", format_duration(benchmark.p50), Color::Cyan),
+            metric_line("P95", format_duration(benchmark.p95), Color::Magenta),
+            metric_line("Minimum", format_duration(benchmark.minimum), Color::Green),
+            metric_line("Maximum", format_duration(benchmark.maximum), Color::Red),
+        ],
+    );
+}
+
+fn benchmark_card_areas(area: Rect) -> Vec<Rect> {
+    if area.width >= 120 {
+        return Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
+            ])
+            .split(area)
+            .to_vec();
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    let top = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[0]);
+    let bottom = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[1]);
+
+    vec![top[0], top[1], bottom[0], bottom[1]]
+}
+
+fn render_metric_card(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    title: &'static str,
+    color: Color,
+    lines: Vec<Line<'static>>,
+) {
+    let card = Paragraph::new(lines).block(
+        Block::default()
+            .title(title)
+            .title_style(Style::default().fg(color).add_modifier(Modifier::BOLD))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(color)),
+    );
+    frame.render_widget(card, area);
+}
+
+fn metric_line(label: &'static str, value: String, color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<9}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            value,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ])
 }
 
 fn render_attention_heatmap(
@@ -1355,6 +1480,7 @@ fn predict_next_token(
     generated_text: &str,
     input_token_ids: &[u32],
 ) -> Result<PredictionResult, anyhow::Error> {
+    let mut visualization_overhead = Duration::ZERO;
     let mut debug_state = InferenceDebugState {
         prompt: prompt.to_string(),
         generated_text: generated_text.to_string(),
@@ -1673,8 +1799,10 @@ fn predict_next_token(
             }
 
             if index == model_configurations.num_hidden_layers.saturating_sub(1) {
+                let visualization_started_at = Instant::now();
                 debug_state.attention_heatmaps =
                     build_attention_heatmaps(index, &q, &k, &attention_mask)?;
+                visualization_overhead += visualization_started_at.elapsed();
             }
 
             let attention_started_at = Instant::now();
@@ -1783,7 +1911,9 @@ fn predict_next_token(
         tensor_shape(&logits),
         logits_started_at,
     );
+    let visualization_started_at = Instant::now();
     debug_state.candidate_logits = collect_top_candidate_logits(&logits, tokenizer, 10)?;
+    visualization_overhead += visualization_started_at.elapsed();
 
     let argmax = argmax(&logits, 2)?;
 
@@ -1792,6 +1922,7 @@ fn predict_next_token(
     Ok(PredictionResult {
         next_token,
         debug_state,
+        visualization_overhead,
     })
 }
 
@@ -1831,12 +1962,15 @@ fn main() -> Result<()> {
 
     let mut input_token_ids = tokens.get_ids().to_vec();
     let mut generated_text = String::new();
+    let mut stats = InferenceStats::new(input_token_ids.len());
     let mut terminal_session = TerminalSession::start()?;
 
     // An LLM predicts the next token from the input text, one token at a time.
     // Since we want a full response rather than a single token, we keep generating
     // tokens until the model emits an end-of-sequence token.
     loop {
+        let context_length = input_token_ids.len();
+        let inference_started_at = Instant::now();
         let mut prediction = predict_next_token(
             &model_configurations,
             &llama_model,
@@ -1845,6 +1979,19 @@ fn main() -> Result<()> {
             &generated_text,
             &input_token_ids,
         )?;
+        let inference_duration = inference_started_at
+            .elapsed()
+            .saturating_sub(prediction.visualization_overhead);
+        let is_eos = model_configurations
+            .eos_token_id
+            .contains(&prediction.next_token);
+
+        stats.record_prediction(
+            context_length,
+            inference_duration,
+            !is_eos,
+            &prediction.debug_state.tensor_flow_steps,
+        );
 
         // Append the generated token to the "context"
         input_token_ids.push(prediction.next_token);
@@ -1853,24 +2000,27 @@ fn main() -> Result<()> {
         prediction.debug_state.current_token_id = Some(prediction.next_token);
         prediction.debug_state.current_token_text = word.clone();
 
-        // Exit when the model says done
-        if model_configurations
-            .eos_token_id
-            .contains(&prediction.next_token)
-        {
+        if is_eos {
+            stats.finish(CompletionReason::EndOfSequence);
             prediction.debug_state.generated_text = generated_text.clone();
+            prediction.debug_state.benchmark = stats.snapshot();
             terminal_session.draw(&prediction.debug_state)?;
             break;
         }
 
         generated_text.push_str(&word);
         prediction.debug_state.generated_text = generated_text.clone();
+        prediction.debug_state.benchmark = stats.snapshot();
         terminal_session.draw(&prediction.debug_state)?;
 
         if should_quit_tui()? {
+            stats.finish(CompletionReason::UserInterrupted);
             break;
         }
     }
+
+    drop(terminal_session);
+    println!("{stats}");
 
     Ok(())
 }
