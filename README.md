@@ -7,7 +7,7 @@ A minimal LLM inference engine for [MiniCPM5-1B](https://huggingface.co/openbmb/
 </p>
 
 <p align="center">
-  <img src="./demo.gif" width="1080">
+  <img src="./assets/demo.gif" width="1080">
 </p>
 
 I built this project to study the fundamentals of large language models. Every understanding is rephrased directly in the code — dense, but organized. My hope is that it helps you learn too.
