@@ -78,6 +78,7 @@ Press `q` to quit early.
 3. **`src/main.rs`** — Model loading and the `predict_next_token` inference flow.
 4. **`src/tui.rs`** — The terminal UI, attention heatmaps, and candidate logits.
 5. **`src/benchmark.rs`** — Live latency, throughput, and operation timing statistics.
+6. **`src/simd.rs`** — SIMD optimizations to the tensor operations.
 
 ## License
 
