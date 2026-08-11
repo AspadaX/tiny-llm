@@ -7,7 +7,10 @@ use anyhow::{Result, anyhow};
 
 use gemm::{Parallelism, gemm};
 use half::{bf16, f16};
+use rten_simd::SimdOp;
 use safetensors::{Dtype, SafeTensors};
+
+use crate::simd::{BinaryOperation, BroadcastBinaryOperation};
 
 #[derive(Debug, Clone)]
 pub struct TinyTensor {
@@ -445,7 +448,7 @@ fn broadcast_view(a: &TinyTensor, shape: &[usize]) -> Result<TinyTensor> {
     })
 }
 
-fn compute_offset_from_linear_index(
+pub fn compute_offset_from_linear_index(
     mut index: usize,
     shape: &[usize],
     strides: &[usize],
@@ -523,14 +526,11 @@ fn compute_offset_from_linear_index(
     offset
 }
 
-fn perform_broadcast_binary_operation<F>(
+fn perform_broadcast_binary_operation(
     a: &TinyTensor,
     b: &TinyTensor,
-    operation: F,
-) -> Result<TinyTensor>
-where
-    F: Fn(f32, f32) -> f32,
-{
+    operation: BinaryOperation,
+) -> Result<TinyTensor> {
     let broadcasted_shape = broadcast_shape(&a.shape, &b.shape)?;
 
     let a_view = broadcast_view(a, &broadcasted_shape)?;
@@ -540,42 +540,40 @@ where
     let b_data = b.data.read().unwrap();
 
     let output_data_length: usize = broadcasted_shape.iter().product();
-    let mut output_data = Vec::with_capacity(output_data_length);
+    let mut output_data = vec![0.0; output_data_length];
 
-    for index in 0..output_data_length {
-        let offset_a = compute_offset_from_linear_index(
-            index,
-            &broadcasted_shape,
-            &a_view.strides,
-            a_view.offset,
-        );
-        let offset_b = compute_offset_from_linear_index(
-            index,
-            &broadcasted_shape,
-            &b_view.strides,
-            b_view.offset,
-        );
+    BroadcastBinaryOperation {
+        a_data: &a_data,
+        b_data: &b_data,
+        output_data: &mut output_data,
 
-        output_data.push(operation(a_data[offset_a], b_data[offset_b]));
+        shape: &broadcasted_shape,
+        a_strides: &a_view.strides,
+        b_strides: &b_view.strides,
+
+        a_offset: a_view.offset,
+        b_offset: b_view.offset,
+        operation,
     }
+    .dispatch();
 
     Ok(TinyTensor::new_from_vec(output_data, &broadcasted_shape)?)
 }
 
 pub fn broadcast_add(a: &TinyTensor, b: &TinyTensor) -> Result<TinyTensor> {
-    perform_broadcast_binary_operation(a, b, |a, b| a + b)
+    perform_broadcast_binary_operation(a, b, BinaryOperation::Add)
 }
 
 pub fn broadcast_multiply(a: &TinyTensor, b: &TinyTensor) -> Result<TinyTensor> {
-    perform_broadcast_binary_operation(a, b, |a, b| a * b)
+    perform_broadcast_binary_operation(a, b, BinaryOperation::Multiply)
 }
 
 pub fn broadcast_divide(a: &TinyTensor, b: &TinyTensor) -> Result<TinyTensor> {
-    perform_broadcast_binary_operation(a, b, |a, b| a / b)
+    perform_broadcast_binary_operation(a, b, BinaryOperation::Divide)
 }
 
 pub fn broadcast_subtract(a: &TinyTensor, b: &TinyTensor) -> Result<TinyTensor> {
-    perform_broadcast_binary_operation(a, b, |a, b| a - b)
+    perform_broadcast_binary_operation(a, b, BinaryOperation::Subtract)
 }
 
 #[allow(dead_code)]

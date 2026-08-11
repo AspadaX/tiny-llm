@@ -1,5 +1,6 @@
 mod algorithms;
 mod benchmark;
+mod simd;
 mod tensors;
 mod tui;
 
