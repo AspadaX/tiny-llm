@@ -395,10 +395,10 @@ pub fn repeat_kv(a: &TinyTensor, n_repetition: usize) -> Result<TinyTensor> {
 /// The `transformers` library implementation of swiglu swapped the `gate_projection` and `up`.
 /// Therefore, when loading llama model weights, we will need to plugin the up to gate and so on.
 pub fn compute_swiglu(
-    hidden_state: &TinyTensor,    // x
-    gate_projection: &TinyTensor, // V
-    up_projection: &TinyTensor,   // W
-    down_projection: &TinyTensor, // W2
+    hidden_state: &TinyTensor, // x [batch_size, sequence_length, hidden_size]
+    gate_projection: &TinyTensor, // V [intermediate_size, hidden_size]
+    up_projection: &TinyTensor, // W [intermediate_size, hidden_size]
+    down_projection: &TinyTensor, // W2 [batch_size, sequence_length, hidden_size]
 ) -> Result<TinyTensor> {
     // The matrix multiplication here uses linear, as it is mathematically identical without a bias,
     // and the linear implementation takes care of the dimensional differences.

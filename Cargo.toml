@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 crossterm = "0.29.0"
-gemm = "0.19.0"
+gemm = { version = "0.19.0", features = ["experimental-apple-amx"] } # The feature option is explained in `OPTIMIZATIONS.md`
 half = "2.7.1"
 ratatui = "0.30.2"
 rten-simd = "0.25.0"
@@ -14,3 +14,7 @@ safetensors = "0.8.0"
 serde = "1.0.228"
 serde_json = "1.0.150"
 tokenizers = "0.23.1"
+
+[profile.profiling]
+inherits = "release"
+debug = true

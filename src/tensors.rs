@@ -3,9 +3,9 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 
-use gemm::{Parallelism, gemm};
+use gemm::{gemm, Parallelism};
 use half::{bf16, f16};
 use rten_simd::SimdOp;
 use safetensors::{Dtype, SafeTensors};
@@ -313,11 +313,14 @@ pub fn matrix_multiply(a: &TinyTensor, b: &TinyTensor) -> Result<TinyTensor> {
     let a_batch_strides = &a.strides[..a.rank() - 2];
     let b_batch_strides = &b.strides[..b.rank() - 2];
 
-    let parallelism = Parallelism::Rayon(
-        std::thread::available_parallelism()
-            .map(|item| item.get())
-            .unwrap_or(1),
-    );
+    let parallelism = match m {
+        1 => Parallelism::None,
+        _ => Parallelism::Rayon(
+            std::thread::available_parallelism()
+                .map(|item| item.get())
+                .unwrap_or(1),
+        ),
+    };
 
     for step in 0..batch {
         let a_offset =

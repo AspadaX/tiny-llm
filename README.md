@@ -42,7 +42,7 @@ For tensor operations, please refer to [tensors.rs](./src/tensors.rs).
 
 The `main` branch contains my hand-written version of tiny-llm. If you would like to have a look at the one based on candle, please refer to `candle-based-implementation` branch.
 
-For now, TinyTensor's performance is on par with that of Candle. I have brief explanations of my optimizations to the inference engine here: [optimizations done so far](./OPTIMIZATIONS.md)
+For now, TinyTensor's performance is on par with that of `candle`. I have brief explanations of my optimizations to the inference engine here: [optimizations done & tried so far](./OPTIMIZATIONS.md)
 
 ## Getting Started
 
