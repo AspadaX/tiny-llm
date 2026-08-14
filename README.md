@@ -20,8 +20,8 @@ Inspired by [tiny-vllm](https://github.com/kuawo/tiny-llm). Coded with love. �
 
 - **CPU-only inference** — no GPU required
 - **Minimal KV-cache** — implemented a simple kv cache that boosts the performance up to 6x.
-- **TUI visualization** — real-time view of how the model "thinks"
 - **Hand-written algorithms and tensor operations** - I hand written the algorithms and tensor ops. Thanks to `candle` for their tensor implementations. I learned a lot from their codebase.
+- **TUI visualization** — real-time view of how the model "thinks"
 
 ### What's implemented
 
