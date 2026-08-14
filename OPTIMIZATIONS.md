@@ -1,16 +1,16 @@
 # Optimizations Done & Tried So Far
 
-Ranked from the earliest to the latest. Each title is followed by their commit head.
+Ranked from the earliest to the latest. Each title is followed by their commit head or branch.
 
-## Original - 04995a950452f76cecfafeba1d743b9e410cc937
+## Original - Branch `candle-based-implementation`
 
 No optimizations. Just a simple engine implemented with `candle`. Good for study the core inference logics and algorithms.
 
-## Hand-written Tensor - 6b23eebc20e3391e907684f9a4a7dd1515ac7f9f
+## Hand-written Tensor - Commit Head `6b23eebc20e3391e907684f9a4a7dd1515ac7f9f`
 
 Implemented a tensor for the engine. The performance is on par with the `candle` cpu backend.
 
-## SIMD Optimization - d3478247cd482324d52d2effdd25dcf44da9a084
+## SIMD Optimization - Commit Head `d3478247cd482324d52d2effdd25dcf44da9a084`
 
 TinyTensor uses [`rten-simd`](https://github.com/robertknight/rten/tree/main/rten-simd) to accelerate broadcast binary operations. Contiguous values are processed using the best SIMD instruction set available at runtime, while scalar broadcasting and arbitrary-stride fallbacks preserve the original tensor semantics.
 
@@ -28,7 +28,7 @@ I also ran the independent gate and up projections concurrently without fusion. 
 
 This outcome is consistent with the existing matrix multiplication implementation: each GEMM already requests Rayon parallelism using `std::thread::available_parallelism()`. Spawning additional threads for the two projections therefore makes concurrent GEMMs compete for the same CPU resources, cache, and memory bandwidth instead of providing additive parallelism. Neither fusion nor outer projection-level parallelism provided a significant improvement in this implementation, so I moved on to other optimization opportunities.
 
-## SIMD Optimization for GEMM - d9982f885d38e418fbaf8a1c359e2d546b8b705d
+## SIMD Optimization for GEMM - Commit Head `d9982f885d38e418fbaf8a1c359e2d546b8b705d`
 
 In the profiling run that prompted this investigation, `matrix_multiply` represented approximately **41%** of the observed performance cost, making GEMM an obvious candidate for further work. However, TinyTensor already passes `f32` input slices and an `f32` destination buffer directly to the resolved [`gemm` 0.19.0](https://github.com/sarah-quinones/gemm) dependency. It also requests Rayon parallelism using `std::thread::available_parallelism()`. The hot path therefore enters `gemm`'s specialized `f32` implementation rather than a naïve scalar triple loop.
 
@@ -38,7 +38,7 @@ The project now also enables `gemm`'s `experimental-apple-amx` feature. On a sup
 
 After enabling AMX on an M3 Macbook Air, the performance share of `matrix_multiply` drops from ~41% to ~37%. A new in-house SIMD GEMM remains a low-priority duplicate of work already done by the dependency. The 41% profile share bounds the possible end-to-end benefit.
 
-## KV Cache - 41bc7a455382b0a906b03d24a287a956b2f6be4b
+## KV Cache - Commit Head `41bc7a455382b0a906b03d24a287a956b2f6be4b`
 
 Traditionally, a transformer model will accept a full text's tokens for predicting the next token. If we want the model to generate coherent text, we need to append the newly generated token to the full text's tokens and then pass all of them into the model again for the next token. This means that every time we generate a new token, the model recomputes QKV tensors across all layers, and the amount of computation keeps growing. Before I implemented the KV cache, the generation speed was on average about 1.x–2.x tokens per second on an M3 MacBook Air.
 

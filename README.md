@@ -40,7 +40,7 @@ Please refer to [algorithms.rs](./src/algorithms.rs) for codes.
 
 For tensor operations, please refer to [tensors.rs](./src/tensors.rs).
 
-The `main` branch contains my hand-written version of tiny-llm. If you would like to have a look at the one based on candle, please refer to `candle-based-implementation` branch.
+The `main` branch contains my hand-written version of tiny-llm. If you would like to have a look at the one based on candle, please refer to `candle-based-implementation` branch. In `without-kv-cache` branch, it has the version without a kv cache.
 
 For now, TinyTensor's performance is on par with or slight faster than that of `candle`.
 
