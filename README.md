@@ -79,6 +79,8 @@ Press `q` to quit early.
 4. **`src/tui.rs`** — The terminal UI, attention heatmaps, and candidate logits.
 5. **`src/benchmark.rs`** — Live latency, throughput, and operation timing statistics.
 6. **`src/simd.rs`** — SIMD optimizations to the tensor operations.
+7. **`src/kv_cache.rs`** — KV cache for this minimal inference engine.
+8. **`src/inference.rs`** — Main logics on model inferencing.
 
 ## License
 
