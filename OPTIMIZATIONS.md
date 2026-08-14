@@ -38,7 +38,7 @@ The project now also enables `gemm`'s `experimental-apple-amx` feature. On a sup
 
 After enabling AMX on an M3 Macbook Air, the performance share of `matrix_multiply` drops from ~41% to ~37%. A new in-house SIMD GEMM remains a low-priority duplicate of work already done by the dependency. The 41% profile share bounds the possible end-to-end benefit.
 
-## KV Cache
+## KV Cache - 41bc7a455382b0a906b03d24a287a956b2f6be4b
 
 Traditionally, a transformer model will accept a full text's tokens for predicting the next token. If we want the model to generate coherent text, we need to append the newly generated token to the full text's tokens and then pass all of them into the model again for the next token. This means that every time we generate a new token, the model recomputes QKV tensors across all layers, and the amount of computation keeps growing. Before I implemented the KV cache, the generation speed was on average about 1.x–2.x tokens per second on an M3 MacBook Air.
 
