@@ -140,18 +140,19 @@ pub(crate) fn build_attention_heatmaps(
 
     let shape = softmaxed.get_shape();
     let num_heads = shape[1];
-    let sequence_length = shape[2];
+    let query_length = shape[2];
+    let key_length = shape[3];
     let all_attention_values = tiny_tensor_to_f32_vec(&softmaxed)?;
     let mut heatmaps = Vec::with_capacity(num_heads);
 
     for head_index in 0..num_heads {
-        let mut values = Vec::with_capacity(sequence_length);
+        let mut values = Vec::with_capacity(query_length);
 
-        for query_position in 0..sequence_length {
-            let mut row = Vec::with_capacity(sequence_length);
-            for key_position in 0..sequence_length {
-                let index = ((head_index * sequence_length + query_position) * sequence_length)
-                    + key_position;
+        for query_position in 0..query_length {
+            let mut row = Vec::with_capacity(key_length);
+            for key_position in 0..key_length {
+                let index =
+                    ((head_index * query_length + query_position) * key_length) + key_position;
                 row.push(all_attention_values.get(index).copied().unwrap_or(0.0));
             }
             values.push(row);
@@ -192,7 +193,7 @@ fn render_inference_debugger(frame: &mut ratatui::Frame, debug_state: &Inference
 
     render_attention_heatmap(frame, middle[0], debug_state);
     render_candidate_logits(frame, middle[1], debug_state);
-    render_benchmark(frame, root[2], &debug_state.benchmark);
+    render_benchmark(frame, root[2], debug_state);
     render_tensor_flow(frame, root[3], debug_state);
 }
 
@@ -241,7 +242,13 @@ fn render_generated_text(
     frame.render_widget(paragraph, area);
 }
 
-fn render_benchmark(frame: &mut ratatui::Frame, area: Rect, benchmark: &InferenceStatsSnapshot) {
+fn render_benchmark(frame: &mut ratatui::Frame, area: Rect, debug_state: &InferenceDebugState) {
+    let benchmark = &debug_state.benchmark;
+    let context_length = debug_state
+        .attention_heatmaps
+        .first()
+        .and_then(|heatmap| heatmap.values.first())
+        .map_or(benchmark.context_length, Vec::len);
     let card_areas = benchmark_card_areas(area);
 
     render_metric_card(
@@ -252,11 +259,7 @@ fn render_benchmark(frame: &mut ratatui::Frame, area: Rect, benchmark: &Inferenc
         vec![
             metric_line("Steps", benchmark.steps.to_string(), Color::Cyan),
             metric_line("Tokens", benchmark.emitted_tokens.to_string(), Color::Green),
-            metric_line(
-                "Context",
-                format!("{} tok", benchmark.context_length),
-                Color::Magenta,
-            ),
+            metric_line("Context", format!("{} tok", context_length), Color::Magenta),
             metric_line("Elapsed", format_duration(benchmark.total), Color::Yellow),
         ],
     );
@@ -424,7 +427,9 @@ fn render_single_attention_heatmap(
     {
         let spans = row
             .iter()
+            .rev()
             .take(area.width.saturating_sub(2) as usize)
+            .rev()
             .map(|value| attention_value_span(*value));
         lines.push(Line::from(spans.collect::<Vec<_>>()));
     }

@@ -46,6 +46,8 @@ For now, TinyTensor's performance is on par with or slight faster than that of `
 
 I have explanations of my optimizations to the inference engine here: [optimizations done & tried so far](./OPTIMIZATIONS.md)
 
+For how to read the TUI, refer to [How to read the TUI](./TUI.md)
+
 ## Getting Started
 
 ### 1. Download the model

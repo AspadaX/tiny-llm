@@ -243,7 +243,6 @@ pub fn create_attention_mask(max_sequence_len: usize) -> Result<TinyTensor> {
     )?)
 }
 
-#[allow(dead_code)]
 pub fn compute_current_attention_mask(
     attention_mask: &TinyTensor,
     current_token_position: usize,
